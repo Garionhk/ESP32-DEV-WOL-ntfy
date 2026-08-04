@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------------
+# Credentials -- never commit
+# ---------------------------------------------------------------------------
+# secrets.h holds the WiFi password, ntfy server, topic, login and command
+# passphrase. The wildcard also catches editor and tooling copies
+# (secrets.h.bak, secrets.h.orig, secrets.h.save, secrets.h~), while the
+# negation keeps the committed template.
+ESP32-WOL-NTFY/secrets.h
+ESP32-WOL-NTFY/secrets.h.*
+ESP32-WOL-NTFY/secrets.h~
+!ESP32-WOL-NTFY/secrets.h.example
+
+# Belt and braces: same patterns anywhere in the tree, in case the sketch
+# folder is ever moved or renamed.
+**/secrets.h
+**/secrets.h.*
+!**/secrets.h.example
+
+# Anything else that tends to hold credentials
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+curl.cfg
+.netrc
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+# Compiled binaries embed secrets.h verbatim -- a .bin is a credential file.
+build/
+Build/
+*.bin
+*.elf
+*.map
+*.hex
+*.o
+*.a
+*.d
+
+# arduino-cli / Arduino IDE
+.arduino/
+*.arduino.*
+sketch/
+
+# ---------------------------------------------------------------------------
+# Test artifacts
+# ---------------------------------------------------------------------------
+test/test_store
+test/test_commands
+test/*.dSYM/
+
+# ---------------------------------------------------------------------------
+# Captured logs -- serial output contains the SSID, local IPs and MACs
+# ---------------------------------------------------------------------------
+*.log
+serial*.txt
+monitor*.txt
+
+# ---------------------------------------------------------------------------
+# OS and editor noise
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
