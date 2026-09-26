@@ -87,7 +87,9 @@ int main() {
   ok(store::count() == MAX_HOSTS - 1, "removal persisted");
 
   printf("-- corrupt blob does not wedge the device\n");
-  Preferences::backing["hosts"] = "{not json at all";
+  // The shim namespaces keys, so poke the same slot store.cpp writes.
+  Preferences::backing[std::string(NVS_NAMESPACE) + "/" + NVS_KEY_HOSTS] =
+      "{not json at all";
   store::begin();
   ok(store::count() == 0, "recovers to empty list");
   store::parseMac("11:22:33:44:55:66", mac);

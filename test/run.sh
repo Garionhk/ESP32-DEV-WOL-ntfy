@@ -20,11 +20,6 @@ if [ ! -d "$JSON" ]; then
   exit 1
 fi
 
-if [ ! -f "$SKETCH/secrets.h" ]; then
-  echo "secrets.h missing -- run: cp $SKETCH/secrets.h.example $SKETCH/secrets.h" >&2
-  exit 1
-fi
-
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
@@ -43,7 +38,14 @@ g++ "${FLAGS[@]}" -o "$OUT/test_store" "$HERE/test_store.cpp" "$SKETCH/store.cpp
 "$OUT/test_store"
 
 echo
+echo "=== settings ==="
+g++ "${FLAGS[@]}" -o "$OUT/test_settings" \
+    "$HERE/test_settings.cpp" "$SKETCH/settings.cpp"
+"$OUT/test_settings"
+
+echo
 echo "=== commands ==="
 g++ "${FLAGS[@]}" -o "$OUT/test_commands" \
-    "$HERE/test_commands.cpp" "$SKETCH/commands.cpp" "$SKETCH/store.cpp"
+    "$HERE/test_commands.cpp" "$SKETCH/commands.cpp" "$SKETCH/store.cpp" \
+    "$SKETCH/settings.cpp"
 "$OUT/test_commands"

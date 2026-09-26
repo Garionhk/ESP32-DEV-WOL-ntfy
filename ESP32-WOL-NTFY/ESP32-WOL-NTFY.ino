@@ -5,7 +5,8 @@
 // something: ntfy carries the command in from anywhere, the ESP32 turns it
 // into a broadcast on the local segment.
 //
-// See README.md for setup. Credentials go in secrets.h.
+// All configuration lives in NVS and is edited from the built-in web portal --
+// nothing user-specific is compiled in. See README.md.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -14,8 +15,15 @@
 #include "commands.h"
 #include "config.h"
 #include "ntfy.h"
-#include "secrets.h"
+#include "settings.h"
 #include "store.h"
+#include "webconfig.h"
+
+// What the device is currently doing. `goOnline()` used to be the only path,
+// implicit in setup(); now that WiFi can come and go while the portal stays
+// up, the transitions need to be explicit.
+enum class Mode { SetupPortal, ApFallback, Online };
+static Mode mode = Mode::SetupPortal;
 
 static uint32_t lastWifiAttemptMs = 0;
 
@@ -54,7 +62,7 @@ static void diagnoseWifi() {
   bool found = false;
   Serial.printf("[wifi] %d network(s) visible on 2.4 GHz:\n", n);
   for (int i = 0; i < n; i++) {
-    bool isOurs = (WiFi.SSID(i) == String(WIFI_SSID));
+    bool isOurs = (WiFi.SSID(i) == g_settings.wifiSsid);
     if (isOurs) found = true;
     Serial.printf("  %-32s ch%-3d %4d dBm  %s%s\n",
                   WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i),
@@ -68,17 +76,17 @@ static void diagnoseWifi() {
   } else {
     Serial.printf("[wifi] \"%s\" was NOT found. It is probably 5 GHz-only "
                   "(the ESP32 cannot see 5 GHz), hidden, or misspelled.\n",
-                  WIFI_SSID);
+                  g_settings.wifiSsid.c_str());
   }
 }
 
 static bool connectWifi(uint32_t timeoutMs) {
-  Serial.printf("[wifi] joining %s\n", WIFI_SSID);
+  Serial.printf("[wifi] joining %s\n", g_settings.wifiSsid.c_str());
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);          // keeps the long-lived ntfy socket responsive
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(g_settings.wifiSsid.c_str(), g_settings.wifiPass.c_str());
 
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
@@ -122,39 +130,127 @@ static bool syncClock() {
   return false;
 }
 
+// Pressing BOOT (GPIO0) just after a reset forces the setup portal on an
+// already-provisioned device -- the way back from a forgotten admin password
+// or a moved network. It has to be pressed AFTER releasing EN: GPIO0 held low
+// through the reset itself puts the ESP32 into its serial bootloader instead.
+static bool bootButtonPressed() {
+  pinMode(0, INPUT_PULLUP);
+  Serial.println("[boot] press BOOT now to open the setup portal");
+  uint32_t start = millis();
+  while (millis() - start < BOOT_WINDOW_MS) {
+    if (digitalRead(0) == LOW) return true;
+    delay(20);
+  }
+  return false;
+}
+
+// Portal with no WiFi behind it. Deliberately has no timeout: an unprovisioned
+// device has no useful fallback state -- no credentials means no WiFi, no ntfy
+// and no purpose -- so a page telling you how to fix that is the most useful
+// thing it can be doing.
+static void runSetupPortal() {
+  mode = Mode::SetupPortal;
+
+  // Deliberately open. This is only reached when the device is unprovisioned
+  // (nothing to protect yet) or when someone pressed the BOOT button, which
+  // already implies physical access -- and anyone holding the board can reflash
+  // it regardless. Requiring the admin password here would turn a forgotten
+  // password into a lockout with no way back except erasing flash over USB.
+  webconfig::beginAP(/*requireAuth=*/false);
+
+  Serial.println("\n=== SETUP MODE ===");
+  uint32_t lastNag = 0;
+  while (!webconfig::saved()) {
+    webconfig::tick();
+    if (millis() - lastNag > 5000) {
+      lastNag = millis();
+      Serial.printf("[setup] join wifi \"%s\" then open %s\n",
+                    webconfig::apSsid().c_str(),
+                    webconfig::settingsUrl().c_str());
+    }
+    delay(5);
+  }
+  // handleSave() restarts the device, so this is never reached.
+}
+
+static void goOnline() {
+  mode = Mode::Online;
+  syncClock();
+  webconfig::beginSTA();
+  ntfy::begin(commands::handle);
+
+  ntfy::publish("WOL bot online\n"
+                "ip: " + WiFi.localIP().toString() + "\n"
+                "settings: " + webconfig::settingsUrl() + "\n" +
+                String(store::count()) + " computer(s) saved. "
+                "Send \"<passphrase> help\" for commands.",
+                "Online");
+
+  Serial.printf("[boot] online, heap %u bytes free\n", (unsigned)ESP.getFreeHeap());
+}
+
+// WiFi is configured but unreachable. Bring the portal up so the settings can
+// be fixed, while the station side keeps retrying in the background -- a router
+// coming back should not need a reboot.
+static void startApFallback() {
+  mode = Mode::ApFallback;
+  webconfig::beginAP(/*requireAuth=*/true);
+  Serial.printf("[wifi] unreachable; portal at %s while retrying in background\n",
+                webconfig::settingsUrl().c_str());
+}
+
 void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(200);
   Serial.println("\n\n=== ESP32 WOL-NTFY ===");
 
   store::begin();
+  settings_begin();
 
-  if (connectWifi(WIFI_CONNECT_TIMEOUT_MS)) {
-    syncClock();
+  // Only worth waiting for on a provisioned board; otherwise setup is next anyway.
+  bool forced = g_settings.provisioned && bootButtonPressed();
+  if (forced) Serial.println("[boot] BOOT pressed -- forcing setup portal");
+
+  if (!g_settings.provisioned || forced) {
+    runSetupPortal();
+  } else if (!connectWifi(WIFI_CONNECT_TIMEOUT_MS)) {
+    startApFallback();
+  } else {
+    goOnline();
   }
-
-  ntfy::begin(commands::handle);
-
-  ntfy::publish("WOL bot online at " + WiFi.localIP().toString() + "\n" +
-                    String(store::count()) + " computer(s) saved. Send \"help\" for commands.",
-                "Online");
-
-  Serial.printf("[boot] ready, heap %u bytes free\n", (unsigned)ESP.getFreeHeap());
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastWifiAttemptMs > WIFI_RETRY_INTERVAL_MS) {
-      lastWifiAttemptMs = millis();
-      Serial.printf("[wifi] link down (%s), retrying\n",
-                    wifiStatusName(WiFi.status()));
-      WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    }
-    delay(100);
-    return;
+  webconfig::tick();          // the portal answers in every mode
+
+  switch (mode) {
+    case Mode::SetupPortal:
+      break;                  // runSetupPortal() blocks; nothing to do here
+
+    case Mode::ApFallback:
+      // WIFI_AP_STA means the station side is still trying underneath us.
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("[wifi] back up, leaving AP mode");
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+        goOnline();
+      } else if (millis() - lastWifiAttemptMs > WIFI_RETRY_INTERVAL_MS) {
+        lastWifiAttemptMs = millis();
+        Serial.printf("[wifi] retrying (%s)\n", wifiStatusName(WiFi.status()));
+        WiFi.begin(g_settings.wifiSsid.c_str(), g_settings.wifiPass.c_str());
+      }
+      break;
+
+    case Mode::Online:
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[wifi] link lost");
+        startApFallback();
+        break;
+      }
+      ntfy::poll();
+      break;
   }
 
-  ntfy::poll();
-  delay(10);   // yields to the WiFi stack; the poll path itself never blocks
+  delay(10);   // yields to the WiFi stack; nothing above blocks
 }

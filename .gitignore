@@ -1,10 +1,9 @@
 # ---------------------------------------------------------------------------
 # Credentials -- never commit
 # ---------------------------------------------------------------------------
-# secrets.h holds the WiFi password, ntfy server, topic, login and command
-# passphrase. The wildcard also catches editor and tooling copies
-# (secrets.h.bak, secrets.h.orig, secrets.h.save, secrets.h~), while the
-# negation keeps the committed template.
+# secrets.h no longer exists -- all configuration moved to NVS and is set from
+# the web portal. These rules stay as a cheap backstop so a stray local
+# secrets.h (an old checkout, a scratch file) can never be committed.
 ESP32-WOL-NTFY/secrets.h
 ESP32-WOL-NTFY/secrets.h.*
 ESP32-WOL-NTFY/secrets.h~
@@ -29,7 +28,8 @@ curl.cfg
 # ---------------------------------------------------------------------------
 # Build output
 # ---------------------------------------------------------------------------
-# Compiled binaries embed secrets.h verbatim -- a .bin is a credential file.
+# Build artefacts. Since configuration moved to NVS these no longer contain
+# credentials, but there is still no reason to commit them.
 build/
 Build/
 *.bin

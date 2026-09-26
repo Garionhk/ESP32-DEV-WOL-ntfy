@@ -4,17 +4,15 @@
 #include "commands.h"
 #include "config.h"
 #include "ntfy.h"
-#include "secrets.h"
+#include "settings.h"
 #include "store.h"
+#include "webconfig.h"
 #include "wol.h"
 
 namespace commands {
 namespace {
 
 const int MAX_TOKENS = 6;
-
-uint8_t  authFailures  = 0;
-uint32_t lockoutUntil  = 0;
 
 int tokenize(const String& input, String out[MAX_TOKENS]) {
   int    n = 0;
@@ -35,45 +33,27 @@ int tokenize(const String& input, String out[MAX_TOKENS]) {
 }
 
 // Compares without an early exit, so response time does not leak how many
-// leading characters were right.
-bool passphraseOk(const String& given) {
-  const char* expected = COMMAND_PASSPHRASE;
-  size_t expectedLen   = strlen(expected);
+// leading characters were right. Case-insensitive, so phone
+// auto-capitalisation doesn't lock you out.
+bool passphraseOk(const String& given, const String& expected) {
+  String a = given, b = expected;
+  a.toLowerCase();
+  b.toLowerCase();
 
-  uint32_t diff = (uint32_t)(given.length() ^ expectedLen);
-  for (size_t i = 0; i < expectedLen; i++) {
-    char g = (i < given.length()) ? given[i] : '\0';
-    diff |= (uint32_t)(g ^ expected[i]);
+  uint32_t diff = (uint32_t)(a.length() ^ b.length());
+  for (unsigned int i = 0; i < b.length(); i++) {
+    char g = (i < a.length()) ? a[i] : '\0';
+    diff |= (uint32_t)(g ^ b[i]);
   }
   return diff == 0;
 }
 
-// Gate for add/rm. Handles the lockout counter and replies on failure, so
-// callers only need to check the return value.
-bool authorize(const String& given) {
-  if (lockoutUntil != 0 && (int32_t)(millis() - lockoutUntil) < 0) {
-    uint32_t remaining = (lockoutUntil - millis() + 999) / 1000;
-    ntfy::publish("Locked out. Try again in " + String(remaining) + "s.",
-                  "Unauthorized");
-    return false;
-  }
-
-  if (passphraseOk(given)) {
-    authFailures = 0;
-    lockoutUntil = 0;
-    return true;
-  }
-
-  authFailures++;
-  if (authFailures >= AUTH_MAX_FAILURES) {
-    lockoutUntil = millis() + AUTH_LOCKOUT_MS;
-    authFailures = 0;
-    ntfy::publish("Unauthorized. Too many attempts -- locked for " +
-                      String(AUTH_LOCKOUT_MS / 1000) + "s.",
-                  "Unauthorized");
-  } else {
-    ntfy::publish("Unauthorized.", "Unauthorized");
-  }
+// add / remove / factoryreset ALWAYS need a passphrase to be set, even though
+// the gate in handle() lets everything through when none is -- ntfy.sh topics
+// are public, so an ungated topic stays read-only.
+bool requireSecret(const String& secret, const char* what, const char* title) {
+  if (!secret.isEmpty()) return true;
+  ntfy::publish(String("Set a command passphrase before ") + what + ".", title);
   return false;
 }
 
@@ -94,12 +74,17 @@ void replyHelp() {
   String help =
       "WOL bot -- commands\n"
       "\n"
-      "list                     show saved computers\n"
-      "wake <name>              send magic packet (\"wake all\" for every host)\n"
-      "add <pass> <name> <mac>  remember a computer\n"
-      "remove <pass> <name>     forget a computer\n"
-      "status                   uptime, IP, wifi, free memory\n"
-      "help                     this message\n"
+      "Start every command with your passphrase:\n"
+      "<passphrase> <command>\n"
+      "\n"
+      "list               show saved computers\n"
+      "wake <name>        send magic packet (\"wake all\" for every host)\n"
+      "add <name> <mac>   remember a computer\n"
+      "remove <name>      forget a computer\n"
+      "status             uptime, IP, wifi, free memory\n"
+      "factoryreset       wipe settings, reboot into setup\n"
+      "                   (\"factoryreset all\" also forgets computers)\n"
+      "help               this message\n"
       "\n"
       "MAC accepts aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, or aabbccddeeff.\n"
       "Names are case-insensitive, up to " + String(MAX_NAME_LEN) +
@@ -110,7 +95,7 @@ void replyHelp() {
 void replyList() {
   if (store::count() == 0) {
     ntfy::publish("No computers saved yet. Add one with:\n"
-                  "add <passphrase> <name> <mac>",
+                  "<passphrase> add <name> <mac>",
                   "Saved computers");
     return;
   }
@@ -127,6 +112,7 @@ void replyStatus() {
   String out =
       "up " + uptimeStr() + "\n" +
       "ip " + WiFi.localIP().toString() + "\n" +
+      "settings " + webconfig::settingsUrl() + "\n" +
       "wifi " + WiFi.SSID() + " (" + String(WiFi.RSSI()) + " dBm)\n" +
       "ntfy " + String(ntfy::connected() ? "connected" : "reconnecting") + "\n" +
       "hosts " + String(store::count()) + "/" + String(MAX_HOSTS) + "\n" +
@@ -162,28 +148,28 @@ void doWake(const String& target) {
                 "Wake");
 }
 
-// add <pass> <name> <mac>
-void doAdd(String tokens[MAX_TOKENS], int count) {
-  if (count < 4) {
-    ntfy::publish("Usage: add <passphrase> <name> <mac>", "Add");
+// add <name> <mac>
+void doAdd(const String& secret, String tokens[MAX_TOKENS], int count) {
+  if (!requireSecret(secret, "adding or removing computers", "Add")) return;
+  if (count < 3) {
+    ntfy::publish("Usage: <passphrase> add <name> <mac>", "Add");
     return;
   }
-  if (!authorize(tokens[1])) return;
 
   uint8_t mac[6];
-  if (!store::parseMac(tokens[3], mac)) {
-    ntfy::publish("\"" + tokens[3] + "\" is not a valid MAC address.", "Add");
+  if (!store::parseMac(tokens[2], mac)) {
+    ntfy::publish("\"" + tokens[2] + "\" is not a valid MAC address.", "Add");
     return;
   }
 
-  switch (store::add(tokens[2], mac)) {
+  switch (store::add(tokens[1], mac)) {
     case store::AddResult::Ok:
-      ntfy::publish("Saved " + store::normalizeName(tokens[2]) + " -> " +
+      ntfy::publish("Saved " + store::normalizeName(tokens[1]) + " -> " +
                         store::formatMac(mac),
                     "Add");
       break;
     case store::AddResult::Duplicate:
-      ntfy::publish("There is already a computer named \"" + tokens[2] +
+      ntfy::publish("There is already a computer named \"" + tokens[1] +
                         "\". Remove it first.",
                     "Add");
       break;
@@ -198,19 +184,46 @@ void doAdd(String tokens[MAX_TOKENS], int count) {
   }
 }
 
-// remove <pass> <name>
-void doRemove(String tokens[MAX_TOKENS], int count) {
-  if (count < 3) {
-    ntfy::publish("Usage: remove <passphrase> <name>", "Remove");
+// remove <name>
+void doRemove(const String& secret, String tokens[MAX_TOKENS], int count) {
+  if (!requireSecret(secret, "adding or removing computers", "Remove")) return;
+  if (count < 2) {
+    ntfy::publish("Usage: <passphrase> remove <name>", "Remove");
     return;
   }
-  if (!authorize(tokens[1])) return;
 
-  if (store::remove(tokens[2])) {
-    ntfy::publish("Forgot " + store::normalizeName(tokens[2]) + ".", "Remove");
+  if (store::remove(tokens[1])) {
+    ntfy::publish("Forgot " + store::normalizeName(tokens[1]) + ".", "Remove");
   } else {
-    ntfy::publish("No computer named \"" + tokens[2] + "\".", "Remove");
+    ntfy::publish("No computer named \"" + tokens[1] + "\".", "Remove");
   }
+}
+
+// factoryreset [all]
+void doFactoryReset(const String& secret, String tokens[MAX_TOKENS], int count) {
+  if (!requireSecret(secret, "using factoryreset", "Factory reset")) return;
+
+  bool wipeHosts = (count >= 2 && tokens[1].equalsIgnoreCase("all"));
+
+  ntfy::publish(String("Clearing settings") +
+                    (wipeHosts ? " and saved computers" : "") +
+                    ". Rebooting into setup mode -- join the \"" +
+                    webconfig::apSsid() + "\" network to reconfigure.",
+                "Factory reset");
+
+  if (wipeHosts) {
+    while (store::count() > 0) {
+      bool removedAny = false;
+      store::forEach([&](const String& name, const uint8_t*) {
+        if (!removedAny) { store::remove(name); removedAny = true; }
+      });
+      if (!removedAny) break;
+    }
+  }
+
+  settings_clear();
+  delay(1500);          // let the reply actually reach the server
+  ESP.restart();
 }
 
 }  // namespace
@@ -219,6 +232,18 @@ void handle(const String& message) {
   String tokens[MAX_TOKENS];
   int    n = tokenize(message, tokens);
   if (n == 0) return;
+
+  // --- passphrase gate --------------------------------------------------
+  // The passphrase prefixes every command. Anything else is ignored without a
+  // reply, so a stranger on the topic gets no hint the device is listening.
+  String secret = g_settings.cmdPass;
+  secret.trim();
+  if (!secret.isEmpty()) {
+    if (!passphraseOk(tokens[0], secret)) return;
+    for (int i = 1; i < n; i++) tokens[i - 1] = tokens[i];
+    tokens[--n] = "";
+    if (n == 0) return;
+  }
 
   String verb = tokens[0];
   verb.toLowerCase();
@@ -233,31 +258,25 @@ void handle(const String& message) {
     replyStatus();
 
   } else if (verb == "wake" || verb == "wol") {
-#if REQUIRE_PASS_FOR_WAKE
-    // Passphrase first, matching add/remove.
-    if (n < 3) {
-      ntfy::publish("Usage: wake <passphrase> <name>   (or \"... all\")", "Wake");
-      return;
-    }
-    if (!authorize(tokens[1])) return;
-    doWake(tokens[2]);
-#else
     if (n < 2) {
-      ntfy::publish("Usage: wake <name>   (or \"wake all\")", "Wake");
+      ntfy::publish("Usage: <passphrase> wake <name>   (or \"... wake all\")", "Wake");
       return;
     }
     doWake(tokens[1]);
-#endif
 
   } else if (verb == "add" || verb == "save") {
-    doAdd(tokens, n);
+    doAdd(secret, tokens, n);
 
   } else if (verb == "rm" || verb == "del" || verb == "delete" ||
              verb == "remove" || verb == "forget") {
-    doRemove(tokens, n);
+    doRemove(secret, tokens, n);
+
+  } else if (verb == "factoryreset") {
+    doFactoryReset(secret, tokens, n);
 
   } else {
-    ntfy::publish("Unknown command \"" + tokens[0] + "\". Send \"help\" for the list.",
+    ntfy::publish("Unknown command \"" + tokens[0] + "\". Send \"<passphrase> help\" "
+                  "for the list.",
                   "Unknown command");
   }
 }

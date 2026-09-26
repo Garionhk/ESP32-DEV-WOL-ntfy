@@ -1,6 +1,6 @@
 #pragma once
 
-// Tunables. Credentials live in secrets.h, not here.
+// Tunables. Credentials live in NVS (settings.cpp), not here.
 
 // ---- Host storage -------------------------------------------------------
 #define MAX_HOSTS          16   // entries the NVS blob will hold
@@ -13,8 +13,8 @@
 #define WOL_REPEAT_GAP_MS 100   // pause between repeats
 
 // ---- ntfy ---------------------------------------------------------------
-// Server host, port, TLS, login and topic live in secrets.h -- they describe
-// your deployment. Only behaviour tuning belongs here.
+// Server host, port, TLS, login and topic live in NVS -- they describe your
+// deployment. Only behaviour tuning belongs here.
 
 // ntfy sends a keepalive about every 45 s. If nothing at all arrives for this
 // long the socket is presumed dead -- the usual failure mode for an always-on
@@ -44,12 +44,9 @@
 #define NTFY_MAX_LINE      2048
 
 // ---- Authorization ------------------------------------------------------
-// Wake is unauthenticated by default: it is harmless and it is the command
-// you want to be quick. Set to 1 to require the passphrase on wake too.
-#define REQUIRE_PASS_FOR_WAKE   0
-
-#define AUTH_MAX_FAILURES       3        // failures before lockout
-#define AUTH_LOCKOUT_MS     60000UL      // how long mutating commands stay shut
+// The command passphrase prefixes EVERY command ("<passphrase> wake pc"); a
+// message without it is ignored silently. It is set on the settings page, not
+// here.
 
 // ---- Networking ---------------------------------------------------------
 #define WIFI_CONNECT_TIMEOUT_MS  30000UL
@@ -57,6 +54,11 @@
 #define NTP_SERVER_1       "pool.ntp.org"
 #define NTP_SERVER_2       "time.nist.gov"
 #define NTP_SYNC_TIMEOUT_MS      30000UL
+
+// How long after a reset the BOOT button is watched for, to force the setup
+// portal. It has to be pressed AFTER releasing EN: GPIO0 held low through the
+// reset itself puts the ESP32 into its serial bootloader instead.
+#define BOOT_WINDOW_MS            2000UL
 
 // TLS certificate validation compares against the clock, so the device must
 // know roughly what year it is before the first connection. Anything past

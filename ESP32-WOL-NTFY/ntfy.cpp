@@ -2,47 +2,60 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <base64.h>
 
+#include "certs.h"
 #include "config.h"
 #include "ntfy.h"
-#include "secrets.h"
-
-#if NTFY_USE_TLS
-#include <WiFiClientSecure.h>
-#include "certs.h"
-// TLS and plain HTTP need different client classes, and the choice is fixed at
-// compile time by secrets.h -- so alias it rather than pay for virtual dispatch
-// and a second code path at runtime.
-typedef WiFiClientSecure NtfyClient;
-#define NTFY_SCHEME "https://"
-#else
-typedef WiFiClient NtfyClient;
-#define NTFY_SCHEME "http://"
-#endif
+#include "settings.h"
 
 namespace ntfy {
 namespace {
 
-NtfyClient     stream;
+// TLS is now a runtime setting, so the client type cannot be a typedef.
+// NetworkClientSecure derives from NetworkClient and HTTPClient::begin() takes
+// the base reference, so one pointer covers both cases.
+NetworkClient* stream = nullptr;
 MessageHandler onMessage;
 
-// "Bearer tk_..." or "Basic base64(user:password)", or empty for an open
-// server. Built once -- the inputs are compile-time constants.
-const String& authHeader() {
-  static String cached;
-  static bool   built = false;
-  if (!built) {
-    if (strlen(NTFY_TOKEN) > 0) {
-      cached = "Bearer " + String(NTFY_TOKEN);
-    } else if (strlen(NTFY_USER) > 0) {
-      // This core's libb64 does not wrap lines, so the result is header-safe.
-      cached = "Basic " +
-               base64::encode(String(NTFY_USER) + ":" + String(NTFY_PASSWORD));
-    }
-    built = true;
+String   cachedAuth;
+bool     authBuilt = false;
+
+String scheme() { return g_settings.ntfyTls ? "https://" : "http://"; }
+
+// Allocates the right client for the configured mode, with the CA bundle and
+// read timeout applied. Caller owns the result.
+NetworkClient* makeClient() {
+  if (g_settings.ntfyTls) {
+    NetworkClientSecure* s = new NetworkClientSecure();
+#if defined(NTFY_TLS_INSECURE)
+    s->setInsecure();
+#else
+    s->setCACert(NTFY_ROOT_CAS);
+#endif
+    s->setTimeout(NTFY_SOCKET_TIMEOUT_MS);
+    return s;
   }
-  return cached;
+  NetworkClient* c = new NetworkClient();
+  c->setTimeout(NTFY_SOCKET_TIMEOUT_MS);
+  return c;
+}
+
+// "Bearer tk_..." or "Basic base64(user:password)", or empty for an open
+// server. Settings are fixed until the next reboot, so building once is safe.
+const String& authHeader() {
+  if (!authBuilt) {
+    if (!g_settings.ntfyToken.isEmpty()) {
+      cachedAuth = "Bearer " + g_settings.ntfyToken;
+    } else if (!g_settings.ntfyUser.isEmpty()) {
+      // This core's libb64 does not wrap lines, so the result is header-safe.
+      cachedAuth = "Basic " +
+                   base64::encode(g_settings.ntfyUser + ":" + g_settings.ntfyPass);
+    }
+    authBuilt = true;
+  }
+  return cachedAuth;
 }
 
 enum class State { Disconnected, Streaming };
@@ -72,25 +85,11 @@ bool alreadySeen(const String& id) {
   return false;
 }
 
-void applyTlsConfig(NtfyClient& client) {
-#if NTFY_USE_TLS
-#if defined(NTFY_TLS_INSECURE)
-  client.setInsecure();
-#elif defined(NTFY_CUSTOM_CA)
-  client.setCACert(NTFY_CUSTOM_CA);   // private or self-signed CA
-#else
-  client.setCACert(NTFY_ROOT_CAS);    // Let's Encrypt / ISRG roots
-#endif
-#else
-  (void)client;                       // plain HTTP: nothing to configure
-#endif
-}
-
 void disconnect(const char* why) {
-  if (state != State::Disconnected || stream.connected()) {
+  if (state != State::Disconnected || (stream && stream->connected())) {
     Serial.printf("[ntfy] disconnecting: %s\n", why);
   }
-  stream.stop();
+  if (stream) stream->stop();
   state = State::Disconnected;
   lineBuf = "";
 
@@ -100,14 +99,14 @@ void disconnect(const char* why) {
 
 bool connect() {
   if (WiFi.status() != WL_CONNECTED) return false;
+  if (!stream) return false;
 
-  Serial.printf("[ntfy] connecting to %s (heap %u)\n", NTFY_HOST,
+  Serial.printf("[ntfy] connecting to %s:%u (%s, heap %u)\n",
+                g_settings.ntfyHost.c_str(), (unsigned)g_settings.ntfyPort,
+                g_settings.ntfyTls ? "tls" : "plain",
                 (unsigned)ESP.getFreeHeap());
 
-  applyTlsConfig(stream);
-  stream.setTimeout(NTFY_SOCKET_TIMEOUT_MS);
-
-  if (!stream.connect(NTFY_HOST, NTFY_PORT)) {
+  if (!stream->connect(g_settings.ntfyHost.c_str(), g_settings.ntfyPort)) {
     Serial.println("[ntfy] TCP/TLS connect failed");
     return false;
   }
@@ -115,11 +114,11 @@ bool connect() {
   // On a cold boot lastId is empty and no ?since= is sent, so only genuinely
   // new messages arrive. Replaying the whole topic history at boot would
   // re-execute every command ever sent.
-  String path = "/" + String(NTFY_TOPIC) + "/json";
+  String path = "/" + g_settings.ntfyTopic + "/json";
   if (!lastId.isEmpty()) path += "?since=" + lastId;
 
   String req = "GET " + path + " HTTP/1.1\r\n"
-               "Host: " + String(NTFY_HOST) + "\r\n"
+               "Host: " + g_settings.ntfyHost + "\r\n"
                "User-Agent: esp32-wol-ntfy\r\n"
                "Accept: application/x-ndjson\r\n";
   if (!authHeader().isEmpty()) {
@@ -127,24 +126,24 @@ bool connect() {
   }
   req += "Connection: keep-alive\r\n\r\n";
 
-  stream.print(req);
+  stream->print(req);
 
   // Status line, then headers up to the blank line.
-  String status = stream.readStringUntil('\n');
+  String status = stream->readStringUntil('\n');
   status.trim();
   if (status.indexOf("200") < 0) {
     Serial.printf("[ntfy] unexpected response: %s\n", status.c_str());
     if (status.indexOf("401") >= 0 || status.indexOf("403") >= 0) {
-      Serial.println("[ntfy] the server rejected the login -- check NTFY_USER / "
-                     "NTFY_PASSWORD / NTFY_TOKEN and this user's access to the "
-                     "topic");
+      Serial.println("[ntfy] the server rejected the login -- check the ntfy "
+                     "username, password or token in the settings page, and "
+                     "this user's access to the topic");
     }
-    stream.stop();
+    stream->stop();
     return false;
   }
 
-  while (stream.connected()) {
-    String header = stream.readStringUntil('\n');
+  while (stream->connected()) {
+    String header = stream->readStringUntil('\n');
     header.trim();
     if (header.isEmpty()) break;   // end of headers
   }
@@ -215,11 +214,19 @@ void begin(MessageHandler handler) {
   onMessage = handler;
   lineBuf.reserve(256);
   nextAttemptMs = 0;
+
+  // Allocated once. Settings cannot change without a reboot, so the client
+  // type is fixed for the lifetime of the process.
+  if (!stream) stream = makeClient();
 }
 
-bool connected() { return state == State::Streaming && stream.connected(); }
+bool connected() {
+  return state == State::Streaming && stream && stream->connected();
+}
 
 void poll() {
+  if (!stream) return;
+
   if (state == State::Disconnected) {
     if ((int32_t)(millis() - nextAttemptMs) < 0) return;
     if (!connect()) {
@@ -229,13 +236,13 @@ void poll() {
     return;
   }
 
-  if (!stream.connected()) {
+  if (!stream->connected()) {
     disconnect("socket closed by peer");
     return;
   }
 
-  while (stream.available()) {
-    char c = (char)stream.read();
+  while (stream->available()) {
+    char c = (char)stream->read();
     lastDataMs = millis();
 
     if (c == '\n') {
@@ -264,16 +271,18 @@ void poll() {
 bool publish(const String& message, const String& title) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  NtfyClient client;
-  applyTlsConfig(client);
-  client.setTimeout(NTFY_SOCKET_TIMEOUT_MS);
+  // A short-lived client per publish, so the TLS buffers are freed straight
+  // after rather than sitting alongside the subscribe connection.
+  NetworkClient* client = makeClient();
+  if (!client) return false;
 
   HTTPClient http;
-  String url = String(NTFY_SCHEME) + NTFY_HOST + ":" + String(NTFY_PORT) + "/" +
-               String(NTFY_TOPIC);
+  String url = scheme() + g_settings.ntfyHost + ":" + String(g_settings.ntfyPort) +
+               "/" + g_settings.ntfyTopic;
 
-  if (!http.begin(client, url)) {
+  if (!http.begin(*client, url)) {
     Serial.println("[ntfy] publish: begin failed");
+    delete client;
     return false;
   }
 
@@ -284,6 +293,7 @@ bool publish(const String& message, const String& title) {
 
   int code = http.POST((uint8_t*)message.c_str(), message.length());
   http.end();
+  delete client;
 
   if (code != HTTP_CODE_OK) {
     Serial.printf("[ntfy] publish failed (%d, heap %u)\n", code,
