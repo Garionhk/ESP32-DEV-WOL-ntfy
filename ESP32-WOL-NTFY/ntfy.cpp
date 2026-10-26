@@ -276,23 +276,31 @@ bool publish(const String& message, const String& title) {
   NetworkClient* client = makeClient();
   if (!client) return false;
 
-  HTTPClient http;
-  String url = scheme() + g_settings.ntfyHost + ":" + String(g_settings.ntfyPort) +
-               "/" + g_settings.ntfyTopic;
+  int code;
+  {
+    // HTTPClient must be gone before the client is deleted. It keeps the
+    // connection for reuse by default, so end() leaves its pointer to the
+    // client set, and its destructor calls client->stop(). Destroyed after
+    // `delete client`, that is a use-after-free -- harmless until the freed
+    // block is reused, which the TLS buffers of the next subscribe
+    // reconnect make near-certain.
+    HTTPClient http;
+    String url = scheme() + g_settings.ntfyHost + ":" + String(g_settings.ntfyPort) +
+                 "/" + g_settings.ntfyTopic;
 
-  if (!http.begin(*client, url)) {
-    Serial.println("[ntfy] publish: begin failed");
-    delete client;
-    return false;
+    if (!http.begin(*client, url)) {
+      Serial.println("[ntfy] publish: begin failed");
+      code = -1;
+    } else {
+      http.addHeader("Content-Type", "text/plain; charset=utf-8");
+      http.addHeader("X-Tags", NTFY_SELF_TAG);   // lets poll() ignore our own echo
+      if (!title.isEmpty()) http.addHeader("X-Title", title);
+      if (!authHeader().isEmpty()) http.addHeader("Authorization", authHeader());
+
+      code = http.POST((uint8_t*)message.c_str(), message.length());
+      http.end();
+    }
   }
-
-  http.addHeader("Content-Type", "text/plain; charset=utf-8");
-  http.addHeader("X-Tags", NTFY_SELF_TAG);   // lets poll() ignore our own echo
-  if (!title.isEmpty()) http.addHeader("X-Title", title);
-  if (!authHeader().isEmpty()) http.addHeader("Authorization", authHeader());
-
-  int code = http.POST((uint8_t*)message.c_str(), message.length());
-  http.end();
   delete client;
 
   if (code != HTTP_CODE_OK) {
