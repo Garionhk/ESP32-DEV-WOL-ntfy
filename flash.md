@@ -178,7 +178,9 @@ table and an OTA selector alongside the application, at specific offsets. Writin
 the application alone to `0x0` produces a board that does not boot.
 
 Simplest — one pre-combined file at `0x0`. Same command for either chip, because
-`merged.bin` already contains everything at the right places:
+`merged.bin` already contains everything at the right places. It is a
+whole-flash image, so it also blanks NVS: a first flash wants exactly that, an
+upgrade that should keep the settings wants the four-file method below.
 
 ```bash
 esptool --port /dev/cu.SLAB_USBtoUART --baud 460800 write-flash 0x0 ESP32-WOL-NTFY.ino.merged.bin
@@ -269,10 +271,15 @@ Both need the same erase-then-write behaviour.
 
 ## 5. Notes
 
-- **Reflashing does not erase settings.** NVS lives outside the application
-  partition and survives a firmware write, so an upgrade keeps the configuration
-  and the saved computers. That is usually what you want; use `erase-flash` for a
-  true factory reset.
+- **Whether reflashing erases settings depends on which method you used.** NVS
+  lives outside the application partition, at `0x9000`, so writing the
+  application does not touch it: the four-file method above keeps the
+  configuration and the saved computers, and so does writing
+  `ESP32-WOL-NTFY.ino.bin` alone at `0x10000`. `merged.bin` is a whole-flash
+  image — blank (`0xff`) everywhere the four pieces do not reach, NVS included —
+  so writing it at `0x0` clears both, as does `erase-flash`. Use the one that
+  matches what you want: the four-file method to upgrade in place, the merged
+  image or `erase-flash` for a clean device.
 - **This firmware has an in-device factory reset**, so returning a provisioned
   device to setup mode does not need USB:
 
@@ -299,7 +306,7 @@ Both need the same erase-then-write behaviour.
   check it there rather than assuming, as it differs for other layouts.
 - **Changing partition scheme requires writing the partition table**, which both
   flashing methods above do. `nvs` sits at `0x9000` in both the default and
-  `huge_app` schemes, so settings and saved computers survive that particular
-  switch.
+  `huge_app` schemes, so the switch itself does not move your settings — but
+  they only survive it if you take the four-file route, per the first note.
 - **There is nothing to distribute alongside the binary.** Configuration exists
   only in NVS on each device, and no build step embeds it.
